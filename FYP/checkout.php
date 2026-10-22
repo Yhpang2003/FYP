@@ -1,58 +1,179 @@
 <?php
+// 1. START OUTPUT BUFFERING
+ob_start();
+
 require_once '_base.php';
-
-
-
 require_auth('Member');
 
 $user_id = $_user->user_id;
 $conn = db_connect();
 
-// --- Handle Order Placement (POST request from this page) ---
-if (is_post() && post('action') === 'place_order') {
-    // 1. Get data from checkout form
-    $address = post('address');
-    $payment_method = post('payment_method');
-    // Get the selected items, which are passed again as a hidden field
-    $selected_ids = post('selected_items');
-    
-    // Simple validation for mock fields (no need to save them)
-    $payment_valid = false;
-    if ($payment_method === 'CreditCard' && post('card_number') && post('card_cvv')) {
-        $payment_valid = true;
-    } else if ($payment_method === 'BankTransfer' && post('bank_reference')) {
-        $payment_valid = true;
-    } else if ($payment_method === 'E-Wallet' && post('ewallet_phone')) {
-        $payment_valid = true;
-    }
+// --- CONFIGURATION ---
+const STRIPE_SECRET_KEY = 'sk_test_51SagLPKCx8DLT9Z9FjeT1aKlHEpYWSBvDbAMGrNLPkqswnVLeUtqSwMW9ZI7KLReKQz8NAuBfDZSG3oPvhz9s75Z006YHtEJXy'; 
+const STRIPE_PUB_KEY    = 'pk_test_51SagLPKCx8DLT9Z9QnWJFMyHQF69VVW59rI1TIFhSXLMxoWwWi64edhuoFzOFSnrWySff6RLpgyQakK4FL70KnMy00k5I7tg1d'; 
 
-    if (empty($address) || empty($payment_method) || empty($selected_ids) || !$payment_valid) {
-        flash('error', 'Please fill in all required fields, including payment details.');
-        // We must re-fetch the data to re-display the form
-        $_POST['selected_items'] = $selected_ids; // Put it back for the GET logic to use
-    } else {
-        // --- Start Database Transaction ---
+// --- HELPER: Shipping Calculator ---
+function calculate_shipping_fee($state) {
+    $east_my = ['Sabah', 'Sarawak', 'Labuan'];
+    return in_array($state, $east_my) ? 20.00 : 10.00;
+}
+
+// --- HELPER: Create Stripe Payment Intent ---
+function create_stripe_payment_intent($amount_myr, $metadata = []) {
+    $url = 'https://api.stripe.com/v1/payment_intents';
+    $data = [
+        'amount' => round($amount_myr * 100), 
+        'currency' => 'myr',
+        'automatic_payment_methods' => ['enabled' => 'true'], 
+        'metadata' => $metadata // Store address here 
+    ];
+
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($data));
+    curl_setopt($ch, CURLOPT_USERPWD, STRIPE_SECRET_KEY . ':'); 
+    
+    $result = curl_exec($ch);
+    if ($result === false) throw new Exception("CURL Error: " . curl_error($ch));
+    $response = json_decode($result, true);
+    curl_close($ch);
+    return $response;
+}
+
+// --- HELPER: Retrieve Intent (Verify Payment) ---
+function retrieve_stripe_intent($intent_id) {
+    // We add '?expand[]=payment_method' to get details like 'grabpay' or 'card'
+    $url = 'https://api.stripe.com/v1/payment_intents/' . $intent_id . '?expand[]=payment_method';
+    
+    $ch = curl_init();
+    curl_setopt($ch, CURLOPT_URL, $url);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_USERPWD, STRIPE_SECRET_KEY . ':'); 
+    $result = curl_exec($ch);
+    curl_close($ch);
+    return json_decode($result, true);
+}
+
+// --- API: HANDLE AJAX REQUEST (Prepare Payment) ---
+if (is_post() && post('action') === 'create_intent') {
+    ob_clean();
+    header('Content-Type: application/json');
+
+    try {
+        $addr_line1 = post('addr_line1');
+        $addr_city  = post('addr_city');
+        $addr_zip   = post('addr_zip');
+        $addr_state = post('addr_state');
+        $selected_ids = post('selected_items'); 
+
+        if (empty($addr_line1) || empty($addr_state) || empty($selected_ids)) {
+            throw new Exception("Please complete the shipping address.");
+        }
+
+        $full_address = "$addr_line1, $addr_zip $addr_city, $addr_state";
+        
+        // 1. Calculate Total (But don't save to DB yet)
+        $selected_ids = array_map('intval', explode(',', $selected_ids));
+        $id_placeholders = implode(',', array_fill(0, count($selected_ids), '?'));
+        $types = str_repeat('i', count($selected_ids));
+        
+        $sql = "SELECT p.product_id, p.name, p.price, p.stock_quantity, ci.quantity 
+                FROM cart_item ci
+                JOIN product p ON ci.product_id = p.product_id
+                JOIN cart c ON ci.cart_id = c.cart_id
+                WHERE c.user_id = ? AND p.product_id IN ($id_placeholders)";
+        
+        $stmt = $conn->prepare($sql);
+        $bind_params = array_merge([$user_id], $selected_ids);
+        $stmt->bind_param("i" . $types, ...$bind_params);
+        $stmt->execute();
+        $items_to_order = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
+        $stmt->close();
+
+        if (count($items_to_order) === 0) throw new Exception("No items found in cart.");
+
+        $subtotal = 0;
+        foreach ($items_to_order as $item) {
+            if ($item['quantity'] > $item['stock_quantity']) {
+                throw new Exception("Item '{$item['name']}' is out of stock.");
+            }
+            $subtotal += $item['price'] * $item['quantity'];
+        }
+        $final_total = $subtotal + calculate_shipping_fee($addr_state);
+        
+        if ($final_total < 2.00) throw new Exception("Minimum order is RM 2.00");
+
+        // 2. Create Stripe Intent (Save Address in Metadata)
+        // We pass 'selected_ids' string too so we know what to buy later
+        $intent = create_stripe_payment_intent($final_total, [
+            'user_id' => $user_id,
+            'address' => $full_address,
+            'item_ids' => post('selected_items') 
+        ]);
+
+        if (isset($intent['error'])) throw new Exception($intent['error']['message']);
+
+        echo json_encode([
+            'status' => 'success',
+            'clientSecret' => $intent['client_secret']
+        ]);
+
+    } catch (Exception $e) {
+        echo json_encode(['status' => 'error', 'message' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// 3. FLUSH BUFFER
+ob_end_flush();
+
+// --- HANDLE SUCCESS RETURN (Insert Order HERE) ---
+if (get('payment_intent') && get('redirect_status') === 'succeeded') {
+    
+    $intent_id = get('payment_intent');
+    
+    // 1. Verify with Stripe that money is actually received
+    $verify = retrieve_stripe_intent($intent_id);
+    
+    if ($verify['status'] === 'succeeded') {
+        $meta = $verify['metadata'];
+        $full_address = $meta['address'];
+        $items_str = $meta['item_ids'];
+        $total_amount = $verify['amount'] / 100; // Convert cents back to RM
+        
+        // 2. DETECT PAYMENT TYPE & MAP TO DB ENUM
+        
+        $stripe_type = $verify['payment_method']['type'] ?? 'card';
+        
+        $db_payment_method = 'CreditCard'; // Default
+        
+        if ($stripe_type === 'fpx') {
+            $db_payment_method = 'BankTransfer';
+        } elseif ($stripe_type !== 'card') {
+            
+            $db_payment_method = 'E-Wallet';
+        }
+
         $conn->begin_transaction();
         try {
-            // 2. Fetch selected items from DB (to verify price & stock one last time)
-            // Ensure $selected_ids is an array before using count()
-            if (!is_array($selected_ids)) {
-                 flash('error', 'Invalid items selected.');
-                 redirect('cart.php');
-            }
-             // Ensure selected_ids are integers before count
-             $selected_ids = array_map('intval', $selected_ids);
-             if (empty($selected_ids)) {
-                 flash('error', 'No items selected.');
-                 redirect('cart.php');
-             }
-
+            // A. Create Order (No Status Column Needed)
+            // Now using dynamic $db_payment_method instead of hardcoded 'CreditCard'
+            $stmt = $conn->prepare("INSERT INTO `order` (user_id, total_amount, address, payment_method) VALUES (?, ?, ?, ?)");
+            $stmt->bind_param("idss", $user_id, $total_amount, $full_address, $db_payment_method);
+            $stmt->execute();
+            $order_id = $stmt->insert_id;
+            $stmt->close();
+            
+            // B. Re-fetch Items to Insert into Order_Item & Deduct Stock
+            $selected_ids = array_map('intval', explode(',', $items_str));
             $id_placeholders = implode(',', array_fill(0, count($selected_ids), '?'));
             $types = str_repeat('i', count($selected_ids));
-            $sql = "SELECT p.product_id, p.name, p.price, p.stock_quantity, ci.quantity 
-                    FROM Cart_Item ci
-                    JOIN Product p ON ci.product_id = p.product_id
-                    JOIN Cart c ON ci.cart_id = c.cart_id
+            
+            $sql = "SELECT p.product_id,p.name , p.price, ci.quantity 
+                    FROM cart_item ci JOIN product p ON ci.product_id = p.product_id
+                    JOIN cart c ON ci.cart_id = c.cart_id
                     WHERE c.user_id = ? AND p.product_id IN ($id_placeholders)";
             
             $stmt = $conn->prepare($sql);
@@ -61,371 +182,373 @@ if (is_post() && post('action') === 'place_order') {
             $stmt->execute();
             $items_to_order = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
             $stmt->close();
+            
+            $stmt_item = $conn->prepare("INSERT INTO `order_item` (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)");
+            $stmt_stock = $conn->prepare("UPDATE product SET stock_quantity = stock_quantity - ? WHERE product_id = ?");
+            $stmt_cart  = $conn->prepare("DELETE FROM cart_item WHERE cart_id = (SELECT cart_id FROM cart WHERE user_id = ?) AND product_id = ?");
+            $stmt_admin = $conn ->prepare("SELECT * FROM User WHERE role='Admin'");
+            $stmt_admin->execute();
+            $admin = $stmt_admin->get_result()->fetch_all(MYSQLI_ASSOC);
 
-             // Verify that the number of items fetched matches the number selected
-             if (count($items_to_order) !== count($selected_ids)) {
-                 flash('error', 'Some selected cart items could not be found or verified.');
-                 $conn->rollback();
-                 redirect('cart.php');
-             }
-
-
-            $total_amount = 0;
-            $items_valid = true;
-
-            // 3. Verify stock and calculate total
             foreach ($items_to_order as $item) {
-                if ($item['quantity'] > $item['stock_quantity']) {
-                    $items_valid = false;
-                    flash('error', 'Item "' . e($item['name']) . '" does not have enough stock.');
-                    break;
+                $stmt_item->bind_param("iiid", $order_id, $item['product_id'], $item['quantity'], $item['price']);
+                $stmt_item->execute();
+                
+                $stmt_stock->bind_param("ii", $item['quantity'], $item['product_id']);
+                $stmt_stock->execute();
+                
+                $stmt_cart->bind_param("ii", $user_id, $item['product_id']);
+                $stmt_cart->execute();
+            }
+            
+            $conn->commit();
+            
+// --- 3. SEND USER SUMMARY EMAIL ---
+            if (function_exists('send_email')) {
+                // Build HTML Table for the email
+                $email_content = "<h1>Order #$order_id Confirmed</h1>";
+                $email_content .= "<p>Thank you for your purchase!</p>";
+                $email_content .= "<h3>Order Details:</h3>";
+                $email_content .= "<table border='1' cellpadding='5' cellspacing='0' style='border-collapse:collapse; width:100%;'>";
+                $email_content .= "<tr style='background:#f2f2f2;'><th>Product</th><th>Qty</th><th>Price</th><th>Total</th></tr>";
+                
+                foreach ($items_to_order as $itm) {
+                    $row_total = $itm['price'] * $itm['quantity'];
+                    $email_content .= "<tr>";
+                    $email_content .= "<td>" . e($itm['name']) . "</td>";
+                    $email_content .= "<td style='text-align:center;'>" . e($itm['quantity']) . "</td>";
+                    $email_content .= "<td>RM " . number_format($itm['price'], 2) . "</td>";
+                    $email_content .= "<td>RM " . number_format($row_total, 2) . "</td>";
+                    $email_content .= "</tr>";
                 }
-                $total_amount += $item['price'] * $item['quantity'];
+                
+                $email_content .= "</table>";
+                $email_content .= "<h3>Grand Total: RM " . number_format($total_amount, 2) . "</h3>";
+                $email_content .= "<p><strong>Shipping Address:</strong><br>" . nl2br(e($full_address)) . "</p>";
+                $email_content .= "<p>Payment Method: " . e($db_payment_method) . "</p>";
+
+                // Send the email
+                send_email($_user->email, $_user->username, "Order #$order_id Confirmed", $email_content);
             }
 
-            if ($items_valid) {
-                // 4. Create the Order
-                $stmt = $conn->prepare("INSERT INTO `Order` (user_id, total_amount, address, payment_method) VALUES (?, ?, ?, ?)");
-                $stmt->bind_param("idss", $user_id, $total_amount, $address, $payment_method);
-                $stmt->execute();
-                $order_id = $stmt->insert_id;
-                $stmt->close();
+            // --- 4. SEND ADMIN LOW STOCK ALERT ---
+            // Fetch admins
+            $stmt_admin = $conn->query("SELECT email, username FROM User WHERE role='Admin'");
+            $admins = $stmt_admin->fetch_all(MYSQLI_ASSOC);
 
-                 if (!$order_id) {
-                     throw new Exception("Failed to create order.");
-                 }
+            // Calculate remaining stock for each item we just bought
+            foreach ($items_to_order as $sold_item) {
+                
+                $stmt_check = $conn->prepare("SELECT stock_quantity, name FROM product WHERE product_id = ?");
+                $stmt_check->bind_param("i", $sold_item['product_id']);
+                $stmt_check->execute();
+                $current_product = $stmt_check->get_result()->fetch_assoc();
+                $stmt_check->close();
 
+            $remaining_stock = $current_product['stock_quantity'];
+    
+            // If stock drops to 5 or below, notify ALL admins
+                if ($remaining_stock <= 5) {
+                $alert_subject = "Low Stock Alert: " . $current_product['name'];
+                $alert_body = "<h1>Stock Alert</h1>";
+                $alert_body .= "<p>Product <strong>" . e($current_product['name']) . "</strong> (ID: " . $sold_item['product_id'] . ") is running low.</p>";
+                $alert_body .= "<p>Remaining Quantity: <strong>$remaining_stock</strong></p>";
+                $alert_body .= "<p>Please restock immediately.</p>";
 
-                // 5. Create Order_Items and Update Product Stock
-                $stmt_order_item = $conn->prepare("INSERT INTO Order_Item (order_id, product_id, quantity, price) VALUES (?, ?, ?, ?)");
-                $stmt_update_stock = $conn->prepare("UPDATE Product SET stock_quantity = stock_quantity - ? WHERE product_id = ?");
-                $stmt_delete_cart = $conn->prepare("DELETE FROM Cart_Item WHERE cart_id = (SELECT cart_id FROM Cart WHERE user_id = ?) AND product_id = ?");
-
-                foreach ($items_to_order as $item) {
-                    // Add to Order_Item
-                    $stmt_order_item->bind_param("iiid", $order_id, $item['product_id'], $item['quantity'], $item['price']);
-                     if(!$stmt_order_item->execute()){
-                         throw new Exception("Failed to insert order item: " . $stmt_order_item->error);
-                    }
-
-                    // Update Product stock
-                    $stmt_update_stock->bind_param("ii", $item['quantity'], $item['product_id']);
-                     if(!$stmt_update_stock->execute()){
-                         throw new Exception("Failed to update stock: " . $stmt_update_stock->error);
-                    }
-
-
-                    // Remove from Cart_Item
-                    $stmt_delete_cart->bind_param("ii", $user_id, $item['product_id']);
-                     if(!$stmt_delete_cart->execute()){
-                         throw new Exception("Failed to delete cart item: " . $stmt_delete_cart->error);
+                foreach ($admins as $admin) {
+                    if (function_exists('send_email')) {
+                   send_email($admin['email'], $admin['username'], $alert_subject, $alert_body);
+                        }
                     }
                 }
-                // Close statements only after the loop is finished
-                $stmt_order_item->close();
-                $stmt_update_stock->close();
-                $stmt_delete_cart->close();
-
-
-                // 6. Commit transaction
-                $conn->commit();
-
-                // --- *** NEW: SEND ORDER CONFIRMATION EMAIL *** ---
-                $email_subject = "Your DIY-Store Order Confirmation (Order #$order_id)";
-                
-                // Build the HTML email body
-                $email_body = "<h1>Thank you for your order, " . e($_user->username) . "!</h1>";
-                $email_body .= "<p>Your order (ID: <b>$order_id</b>) has been placed successfully.</p>";
-                $email_body .= "<h2>Order Summary</h2>";
-                $email_body .= "<table border='1' cellpadding='8' cellspacing='0' style='border-collapse: collapse;'>";
-                $email_body .= "<thead style='background-color: #f4f4f4;'><tr><th>Item</th><th>Quantity</th><th>Price</th><th>Total</th></tr></thead>";
-                $email_body .= "<tbody>";
-
-                foreach ($items_to_order as $item) {
-                    $item_total = $item['price'] * $item['quantity'];
-                    $email_body .= "<tr>";
-                    $email_body .= "<td>" . e($item['name']) . "</td>";
-                    $email_body .= "<td>" . e($item['quantity']) . "</td>";
-                    $email_body .= "<td>RM" . number_format($item['price'], 2) . "</td>";
-                    $email_body .= "<td>RM" . number_format($item_total, 2) . "</td>";
-                    $email_body .= "</tr>";
-                }
-                
-                $email_body .= "<tr><td colspan='3' style='text-align:right;'><b>Total:</b></td><td><b>RM" . number_format($total_amount, 2) . "</b></td></tr>";
-                $email_body .= "</tbody></table>";
-                
-                $email_body .= "<h3 style='margin-top: 20px;'>Shipping Address:</h3>";
-                $email_body .= "<p>" . nl2br(e($address)) . "</p>"; // nl2br converts newlines
-                
-                $email_body .= "<h3>Payment Method:</h3>";
-                $email_body .= "<p>" . e($payment_method) . "</p>";
-                
-                $email_body .= "<p style='margin-top: 20px;'>You can view your order details anytime by visiting your Order History page:</p>";
-                $email_body .= "<a href='http://localhost/FYP/order_details.php?order_id=$order_id' style='display:inline-block; padding: 10px 15px; background-color: #007bff; color: #ffffff; text-decoration: none; border-radius: 5px;'>View Your Order</a>";
-
-                
-                send_email($_user->email, $_user->username, $email_subject, $email_body);
-                // --- *** END OF EMAIL LOGIC *** ---
-
-
-                // 7. Redirect to the order details page
-                flash('success', 'Order placed successfully!'); // Set flash message
-                redirect('order_details.php?order_id=' . $order_id);
-            } else {
-                // Rollback if stock check failed
-                $conn->rollback();
-                redirect('cart.php'); // Send back to cart if stock is bad
             }
+
+            flash('success', 'Payment Successful! Order placed.');
+            redirect("order_details.php?order_id=$order_id");
 
         } catch (Exception $e) {
             $conn->rollback();
-            // Log the detailed error for the developer
-            error_log("Order placement error: " . $e->getMessage());
-            // Show a generic message to the user
-            flash('error', 'An error occurred while placing your order. Please try again.');
-             // Redirect back to cart on general error
+            flash('error', 'Payment succeeded but order creation failed: ' . $e->getMessage());
             redirect('cart.php');
-        } finally {
-            // Ensure connection is closed only if it was successfully opened and is still active
-             if ($conn) {
-                 $conn->close();
-             }
         }
     }
-} else { // Handle the GET request part for displaying the checkout page OR handle POST validation failure
+}
 
-    // --- Display Checkout Page (GET request or from cart POST) ---
-    $selected_items_details = []; // Renamed to avoid confusion with $selected_ids
-    $total_price = 0;
-    // Use POST 'selected_items' (coming from cart form OR from failed validation)
-    $selected_ids = $_POST['selected_items'] ?? []; 
+// --- DISPLAY PAGE ---
+$selected_ids = $_POST['selected_items'] ?? [];
+if (empty($selected_ids) && !get('payment_intent')) redirect('cart.php');
 
-    if (empty($selected_ids) || !is_array($selected_ids)) {
-        flash('error', 'You did not select any items to checkout.');
-        redirect('cart.php');
-    }
-
-    // Ensure all IDs are integers for security
-    $selected_ids = array_map('intval', $selected_ids);
-    // Remove potential 0s if intval failed or if 0 was passed
-    $selected_ids = array_filter($selected_ids, function($id) { return $id > 0; });
-
-     if (empty($selected_ids)) {
-        flash('error', 'Invalid items selected for checkout.');
-        redirect('cart.php');
-     }
-
-
-    // Fetch details for only the selected items
-    $id_placeholders = implode(',', array_fill(0, count($selected_ids), '?'));
-    $types = str_repeat('i', count($selected_ids));
-
+if (!empty($selected_ids)) {
+    $selected_ids_safe = array_map('intval', $selected_ids);
+    $placeholders = implode(',', array_fill(0, count($selected_ids_safe), '?'));
+    
     $sql = "SELECT p.product_id, p.name, p.price, p.image, ci.quantity 
-            FROM Cart_Item ci
-            JOIN Product p ON ci.product_id = p.product_id
-            JOIN Cart c ON ci.cart_id = c.cart_id
-            WHERE c.user_id = ? AND p.product_id IN ($id_placeholders)";
-
+            FROM cart_item ci JOIN product p ON ci.product_id = p.product_id
+            JOIN cart c ON ci.cart_id = c.cart_id
+            WHERE c.user_id = ? AND p.product_id IN ($placeholders)";
+    
     $stmt = $conn->prepare($sql);
-    // Ensure parameters are passed correctly for bind_param
-    $bind_params = array_merge([$user_id], $selected_ids);
-    $stmt->bind_param("i" . $types, ...$bind_params);
+    $params = array_merge([$user_id], $selected_ids_safe);
+    $stmt->bind_param("i" . str_repeat('i', count($selected_ids_safe)), ...$params);
     $stmt->execute();
-    $result = $stmt->get_result();
-
-    while ($item = $result->fetch_assoc()) {
-        $selected_items_details[] = $item; // Populate the details array
-        $total_price += $item['price'] * $item['quantity'];
-    }
+    $cart_items = $stmt->get_result()->fetch_all(MYSQLI_ASSOC);
     $stmt->close();
     
-    // Check if the fetched items match the selected IDs count
-    if (count($selected_items_details) !== count($selected_ids)) {
-        // This can happen if items were removed or invalid IDs were somehow sent
-        flash('error', 'Some selected items could not be found.');
-         if ($conn) $conn->close(); // Close connection before redirect
-        redirect('cart.php');
+    $subtotal = 0;
+    foreach ($cart_items as $item) {
+        $subtotal += $item['price'] * $item['quantity'];
     }
-    
-    // --- ALL LOGIC IS DONE. NOW WE CAN PRINT THE HTML ---
-    require_once '_head.php'; 
+}
+
+require_once '_head.php'; 
 ?>
+
+<!-- Stripe JS -->
+<script src="https://js.stripe.com/v3/"></script>
 
 <div class="container mx-auto px-4 py-8">
     <h1 class="text-3xl font-bold text-gray-900 mb-6">Checkout</h1>
-    
     <?php flash_messages(); ?>
 
-    <form id="checkout-form" action="checkout.php" method="POST">
-        <!-- Hidden field to mark this as the final order submission -->
-        <input type="hidden" name="action" value="place_order">
-        
-        <!-- Pass the selected item IDs along to the processing logic -->
-        <?php foreach ($selected_ids as $id): ?>
-            <input type="hidden" name="selected_items[]" value="<?= e($id) ?>">
-        <?php endforeach; ?>
+    <div class="flex flex-col lg:flex-row gap-8">
+        <div class="lg:w-2/3 space-y-6">
+            <form id="address-form">
+                <input type="hidden" id="selected_items_str" value="<?= implode(',', $selected_ids ?? []) ?>">
 
-        <div class="flex flex-col lg:flex-row gap-8">
-            
-            <!-- Shipping & Payment Details -->
-            <div class="lg:w-2/3">
+                <!-- Address Section -->
                 <div class="bg-white p-6 rounded-lg shadow-md">
-                    <h2 class="text-2xl font-bold text-gray-800 border-b pb-4 mb-4">Shipping & Payment</h2>
+                    <h2 class="text-xl font-bold text-gray-800 mb-4">1. Shipping Address</h2>
                     
                     <div class="mb-4">
-                        <label for="address" class="block text-gray-700 text-sm font-bold mb-2">Shipping Address:</label>
-                        <!-- Use the value submitted if validation failed -->
-                        <textarea id="address" name="address" rows="4" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline" required><?= e(post('address')) ?></textarea>
-                        <?php err('address'); ?>
+                        <label class="block text-gray-700 text-sm mb-2">Address Line 1</label>
+                        <input type="text" id="addr_line1" name="addr_line1" class="w-full border rounded p-2 outline-none focus:ring-2 focus:ring-blue-500" placeholder="123 Jalan ABC" required value="<?= e(post('addr_line1')) ?>">
                     </div>
 
-                    <div class="mb-4">
-                        <label for="payment_method" class="block text-gray-700 text-sm font-bold mb-2">Payment Method:</label>
-                        <select id="payment_method" name="payment_method" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline" required>
-                            <option value="">-- Select a Method --</option>
-                            <!-- Keep selected value if validation failed -->
-                            <option value="CreditCard" <?= post('payment_method') == 'CreditCard' ? 'selected' : '' ?>>Credit Card</option>
-                            <option value="BankTransfer" <?= post('payment_method') == 'BankTransfer' ? 'selected' : '' ?>>Bank Transfer</option>
-                            <option value="E-Wallet" <?= post('payment_method') == 'E-Wallet' ? 'selected' : '' ?>>E-Wallet</option>
+                    <div class="grid grid-cols-2 gap-4 mb-4">
+                        <div>
+                            <label class="block text-gray-700 text-sm mb-2">City</label>
+                            <input type="text" id="addr_city" name="addr_city" class="w-full border rounded p-2 outline-none focus:ring-2 focus:ring-blue-500" placeholder="Kuala Lumpur" required value="<?= e(post('addr_city')) ?>">
+                        </div>
+                        <div>
+                            <label class="block text-gray-700 text-sm mb-2">Postcode</label>
+                            <input type="text" id="addr_zip" name="addr_zip" class="w-full border rounded p-2 outline-none focus:ring-2 focus:ring-blue-500" placeholder="53300" required value="<?= e(post('addr_zip')) ?>">
+                        </div>
+                    </div>
+
+                    <div class="mb-2">
+                        <label class="block text-gray-700 text-sm mb-2">State</label>
+                        <select id="addr_state" name="addr_state" class="w-full border rounded p-2 outline-none focus:ring-2 focus:ring-blue-500" required>
+                            <option value="">-- Select State --</option>
+                            <optgroup label="West Malaysia">
+                                <option value="Johor">Johor</option>
+                                <option value="Kedah">Kedah</option>
+                                <option value="Kelantan">Kelantan</option>
+                                <option value="Kuala Lumpur">Kuala Lumpur</option>
+                                <option value="Melaka">Melaka</option>
+                                <option value="Negeri Sembilan">Negeri Sembilan</option>
+                                <option value="Pahang">Pahang</option>
+                                <option value="Perak">Perak</option>
+                                <option value="Perlis">Perlis</option>
+                                <option value="Pulau Pinang">Pulau Pinang</option>
+                                <option value="Putrajaya">Putrajaya</option>
+                                <option value="Selangor">Selangor</option>
+                                <option value="Terengganu">Terengganu</option>
+                            </optgroup>
+                            <optgroup label="East Malaysia">
+                                <option value="Labuan">Labuan</option>
+                                <option value="Sabah">Sabah</option>
+                                <option value="Sarawak">Sarawak</option>
+                            </optgroup>
                         </select>
-                        <?php err('payment_method'); ?>
                     </div>
-
-                    <!-- Mock Payment Fields -->
-                    <div id="payment-details" class="mt-6 border-t pt-6">
-                        <!-- Credit Card Fields -->
-                        <div id="credit-card-fields" class="payment-fields hidden space-y-4">
-                            <div>
-                                <label for="card_number" class="block text-gray-700 text-sm font-bold mb-2">Card Number:</label>
-                                <input type="text" id="card_number" name="card_number" value="<?= e(post('card_number')) ?>" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700" placeholder="1234 5678 1234 5678">
-                            </div>
-                            <div class="grid grid-cols-2 gap-4">
-                                <div>
-                                    <label for="card_expiry" class="block text-gray-700 text-sm font-bold mb-2">Expiry Date:</label>
-                                    <input type="text" id="card_expiry" name="card_expiry" value="<?= e(post('card_expiry')) ?>" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700" placeholder="MM/YY">
-                                </div>
-                                <div>
-                                    <label for="card_cvv" class="block text-gray-700 text-sm font-bold mb-2">CVV:</label>
-                                    <input type="text" id="card_cvv" name="card_cvv" value="<?= e(post('card_cvv')) ?>" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700" placeholder="123">
-                                </div>
-                            </div>
-                        </div>
-
-                        <!-- Bank Transfer Fields -->
-                        <div id="bank-transfer-fields" class="payment-fields hidden">
-                            <p class="text-gray-700 mb-2">Please transfer to the following bank account:</p>
-                            <p class="font-mono p-2 bg-gray-100 rounded">Maybank: 1234567890 (DIY Store)</p>
-                            <div class="mt-4">
-                                <label for="bank_reference" class="block text-gray-700 text-sm font-bold mb-2">Reference ID:</label>
-                                <input type="text" id="bank_reference" name="bank_reference" value="<?= e(post('bank_reference')) ?>" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700" placeholder="Your Transaction ID">
-                            </div>
-                        </div>
-
-                        <!-- E-Wallet Fields -->
-                        <div id="e-wallet-fields" class="payment-fields hidden">
-                            <p class="text-gray-700 mb-2">Please pay to the following number:</p>
-                            <p class="font-mono p-2 bg-gray-100 rounded">TNG E-Wallet: 012-3456789 (DIY Store)</p>
-                            <div class="mt-4">
-                                <label for="ewallet_phone" class="block text-gray-700 text-sm font-bold mb-2">Your Phone Number:</label>
-                                <input type="text" id="ewallet_phone" name="ewallet_phone" value="<?= e(post('ewallet_phone')) ?>" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700" placeholder="01x-xxxxxxx">
-                            </div>
-                        </div>
-                    </div>
-                    <!-- End Mock Payment Fields -->
-
                 </div>
-            </div>
+            </form>
 
-            <!-- Order Summary -->
-            <div class="lg:w-1/3">
-                <div class="bg-white p-6 rounded-lg shadow-md sticky top-8">
-                    <h2 class="text-2xl font-bold text-gray-800 border-b pb-4 mb-4">Your Order</h2>
-                    
-                    <?php if (!empty($selected_items_details)):?>
-                        <?php foreach ($selected_items_details as $item): ?>
-                        <div class="flex justify-between items-center py-2 border-b">
-                            <div class="flex items-center">
-                                <img src="/FYP/<?= e($item['image'] ?? 'https://placehold.co/100x100/e2e8f0/cbd5e0?text=No+Image') ?>" alt="<?= e($item['name']) ?>" class="w-12 h-12 object-cover rounded-md mr-3">
-                                <div>
-                                    <span class="font-semibold"><?= e($item['name']) ?></span>
-                                    <span class="block text-sm text-gray-600">Qty: <?= e($item['quantity']) ?></span>
-                                </div>
-                            </div>
-                            <span class="font-semibold">RM<?= e(number_format($item['price'] * $item['quantity'], 2)) ?></span>
-                        </div>
-                        <?php endforeach; ?>
-                    <?php else: ?>
-                         <p class="text-gray-600">No items selected for checkout.</p>
-                    <?php endif; ?>
-
-
-                    <div class="flex justify-between text-xl font-bold border-t pt-4 mt-4">
-                        <span>Total</span>
-                        <span>RM<?= e(number_format($total_price, 2)) ?></span>
+            <!-- Payment Section -->
+            <div class="bg-white p-6 rounded-lg shadow-md">
+                <h2 class="text-xl font-bold text-gray-800 mb-4">2. Payment Method</h2>
+                
+                <div id="payment-element">
+                    <!-- Stripe injects UI here -->
+                    <div class="text-gray-500 text-sm p-4 bg-gray-50 rounded">
+                        Please fill in your address above to load payment options.
                     </div>
-                    
-                    <button type="submit" class="block text-center w-full mt-6 bg-green-600 hover:bg-green-700 text-white font-bold py-3 px-4 rounded-lg">
-                        Place Order
-                    </button>
                 </div>
+                
+                <div id="payment-message" class="hidden mt-4 text-red-500 text-sm"></div>
             </div>
         </div>
-    </form>
+
+        <!-- Summary -->
+        <div class="lg:w-1/3">
+            <div class="bg-white p-6 rounded-lg shadow-md sticky top-8">
+                <h2 class="text-2xl font-bold text-gray-800 border-b pb-4 mb-4">Summary</h2>
+                <div class="border-t pt-4 space-y-2">
+                    <div class="flex justify-between text-gray-600">
+                        <span>Subtotal</span><span>RM<?= number_format($subtotal ?? 0, 2) ?></span>
+                    </div>
+                    <div class="flex justify-between text-gray-600">
+                        <span>Shipping <span id="shipping-region" class="text-xs text-blue-500">(West MY)</span></span>
+                        <span id="shipping-display">RM10.00</span>
+                    </div>summar
+                    <div class="flex justify-between text-2xl font-bold text-gray-900 pt-2 border-t mt-2">
+                        <span>Total</span><span id="grand-total-display">RM<?= number_format(($subtotal ?? 0) + 10, 2) ?></span>
+                    </div>
+                </div>
+                
+                <button id="submit-btn" class="w-full mt-6 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed">
+                    Pay Now
+                </button>
+            </div>
+        </div>
+    </div>
 </div>
 
-<!-- JavaScript for payment fields -->
 <script>
-document.addEventListener('DOMContentLoaded', () => {
-    const paymentMethod = document.getElementById('payment_method');
-    const allPaymentFields = document.querySelectorAll('.payment-fields');
-    const ccFields = document.getElementById('credit-card-fields');
-    const ccNumber = document.getElementById('card_number');
-    const ccCvv = document.getElementById('card_cvv');
-    const bankFields = document.getElementById('bank-transfer-fields');
-    const bankRef = document.getElementById('bank_reference');
-    const ewalletFields = document.getElementById('e-wallet-fields');
-    const ewalletPhone = document.getElementById('ewallet_phone');
+// --- FRONTEND LOGIC ---
+const stripe = Stripe('<?= STRIPE_PUB_KEY ?>');
+let elements;
 
-    paymentMethod.addEventListener('change', () => {
-        // Hide all fields first
-        allPaymentFields.forEach(f => f.classList.add('hidden'));
+// Constants
+const subtotal = <?= $subtotal ?? 0 ?>;
+const stateSelect = document.getElementById('addr_state');
+const shippingDisplay = document.getElementById('shipping-display');
+const regionDisplay = document.getElementById('shipping-region');
+const grandTotalDisplay = document.getElementById('grand-total-display');
+const submitBtn = document.getElementById('submit-btn');
+
+// 2. Shipping Calculation UI
+function updateTotals() {
+    const state = stateSelect.value;
+    let shippingFee = 10.00;
+    let region = "(West MY)";
+    
+    if (['Sabah', 'Sarawak', 'Labuan'].includes(state)) {
+        shippingFee = 20.00;
+        region = "(East MY)";
+    }
+
+    shippingDisplay.textContent = 'RM' + shippingFee.toFixed(2);
+    regionDisplay.textContent = region;
+    grandTotalDisplay.textContent = 'RM' + (subtotal + shippingFee).toFixed(2);
+}
+stateSelect.addEventListener('change', updateTotals);
+
+// 3. Handle "Pay Now" Click
+submitBtn.addEventListener('click', async (e) => {
+    e.preventDefault();
+    
+    // Validate Form
+    const form = document.getElementById('address-form');
+    if (!form.checkValidity()) {
+        form.reportValidity();
+        return;
+    }
+
+    setLoading(true);
+
+    // CRITICAL: Call elements.submit() BEFORE anything else
+    // This triggers validation on Stripe fields
+    const { error: submitError } = await elements.submit();
+    if (submitError) {
+        showMessage(submitError.message);
+        setLoading(false);
+        return; // Stop execution if Stripe form is invalid
+    }
+
+    // Step A: Create PaymentIntent on Server (NO DB INSERT YET)
+    const formData = new FormData(form);
+    formData.append('action', 'create_intent');
+    formData.append('selected_items', document.getElementById('selected_items_str').value);
+
+    try {
+        const response = await fetch('checkout.php', {
+            method: 'POST',
+            body: formData
+        });
         
-        // Disable 'required' on all inputs
-        ccNumber.required = false;
-        ccCvv.required = false;
-        bankRef.required = false;
-        ewalletPhone.required = false;
-
-        // Show the selected one and set 'required'
-        const selectedMethod = paymentMethod.value;
-        if (selectedMethod === 'CreditCard') {
-            ccFields.classList.remove('hidden');
-            ccNumber.required = true;
-            ccCvv.required = true;
-        } else if (selectedMethod === 'BankTransfer') {
-            bankFields.classList.remove('hidden');
-            bankRef.required = true;
-        } else if (selectedMethod === 'E-Wallet') {
-            ewalletFields.classList.remove('hidden');
-            ewalletPhone.required = true;
+        const textResponse = await response.text();
+        let data;
+        try {
+            data = JSON.parse(textResponse);
+        } catch (e) {
+            console.error("Server Raw Response:", textResponse);
+            throw new Error("Server Error (Not JSON). Check Console for details.");
         }
-    });
 
-    // Trigger change event on page load if a method is already selected (e.g., on form error)
-    if (paymentMethod.value) {
-        paymentMethod.dispatchEvent(new Event('change'));
+        if (data.status === 'error') {
+            throw new Error(data.message);
+        }
+
+        // Step B: Confirm Payment with Stripe
+        const { error } = await stripe.confirmPayment({
+            elements,
+            clientSecret: data.clientSecret,
+            confirmParams: {
+                // IMPORTANT: We redirect BACK to checkout.php, where we will insert the order
+                return_url: window.location.origin + window.location.pathname,
+                payment_method_data: {
+                    billing_details: {
+                        address: {
+                            line1: formData.get('addr_line1'),
+                            city: formData.get('addr_city'),
+                            postal_code: formData.get('addr_zip'),
+                            state: formData.get('addr_state'),
+                            country: 'MY', // Hardcoded for this project
+                        }
+                    }
+                }
+            },
+        });
+
+        if (error) {
+            showMessage(error.message);
+            setLoading(false);
+        }
+
+    } catch (err) {
+        showMessage(err.message);
+        setLoading(false);
     }
 });
+
+// 4. Initialize Stripe Elements (Pre-load)
+async function initializeStripe() {
+    const appearance = { theme: 'stripe' };
+    elements = stripe.elements({ 
+        appearance, 
+        mode: 'payment', 
+        currency: 'myr', 
+        amount: Math.round((subtotal + 10) * 100), // Approx initial amount
+        locale: 'en'
+    });
+
+    const paymentElement = elements.create("payment");
+    paymentElement.mount("#payment-element");
+}
+
+initializeStripe();
+
+function setLoading(isLoading) {
+    if (isLoading) {
+        submitBtn.disabled = true;
+        submitBtn.textContent = "Processing...";
+    } else {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Pay Now";
+    }
+}
+
+function showMessage(messageText) {
+    const messageContainer = document.querySelector("#payment-message");
+    messageContainer.classList.remove("hidden");
+    messageContainer.textContent = messageText;
+    
+    setTimeout(() => {
+        messageContainer.classList.add("hidden");
+        messageContainer.textContent = "";
+    }, 10000);
+}
 </script>
 
-<?php
-} // End the else block for handling GET request / POST validation failure
-
-// Only close connection if it's still open and the script hasn't exited via redirect
-// REMOVED: Deprecated ping check
-if ($conn && $conn instanceof mysqli && $conn->thread_id) {
-     $conn->close();
-}
-require_once '_foot.php';
-?>
-
+<?php require_once '_foot.php'; ?>

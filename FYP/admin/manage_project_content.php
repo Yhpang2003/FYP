@@ -201,6 +201,7 @@ require_once '../_head.php';
                     <label for="product_id" class="block text-gray-700 text-sm font-bold mb-2">Product:</label>
                     <select id="product_id" name="product_id" class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline" required>
                         <option value="">-- Select a Product --</option>
+                        
                         <?php foreach ($all_products as $product): ?>
                             <option value="<?= e($product['product_id']) ?>"><?= e($product['name']) ?> (RM<?= e(number_format($product['price'], 2)) ?>)</option>
                         <?php endforeach; ?>

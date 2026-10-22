@@ -53,7 +53,9 @@ try {
     $stmt_check_item = $conn->prepare("SELECT quantity FROM Cart_Item WHERE cart_id = ? AND product_id = ?");
     $stmt_update_item = $conn->prepare("UPDATE Cart_Item SET quantity = ? WHERE cart_id = ? AND product_id = ?");
     $stmt_insert_item = $conn->prepare("INSERT INTO Cart_Item (cart_id, product_id, quantity) VALUES (?, ?, ?)");
-    
+    // this one for log user activity
+    $stmt_log = $conn->prepare("INSERT INTO Browse_History (user_id, product_id, activity_type) VALUES (?, ?, 'add_to_cart')");
+
     $all_items_ok = true;
 
     foreach ($materials as $material) {
@@ -92,12 +94,16 @@ try {
             $stmt_insert_item->bind_param("iii", $cart_id, $product_id, $required_quantity);
             $stmt_insert_item->execute();
         }
+        //log user activity
+        $stmt_log->bind_param("ii", $user_id, $product_id);
+        $stmt_log->execute();
     }
     
     // Close prepared statements
     $stmt_check_item->close();
     $stmt_update_item->close();
     $stmt_insert_item->close();
+    $stmt_log->close();
 
     // Commit transaction
     $conn->commit();

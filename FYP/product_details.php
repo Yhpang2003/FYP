@@ -21,13 +21,54 @@ $stmt->execute();
 $result = $stmt->get_result();
 $product = $result->fetch_assoc();
 $stmt->close();
-$conn->close();
 
-// If no product was found (or it's disabled), redirect away
+
+
+// If no product was found
 if (!$product) {
     flash('error', 'The product you are looking for does not exist or is unavailable.');
     redirect('products.php');
 }
+
+
+// Record user activity
+$current_user_id = 0;
+if (is_auth()&& !is_admin()) {
+    $user_id = $_user->user_id;
+    $stmt_log = $conn->prepare("INSERT INTO Browse_History (user_id, product_id, activity_type) VALUES (?, ?, 'view')");
+    $stmt_log->bind_param("ii", $user_id, $id);
+    $stmt_log->execute();
+    $stmt_log->close();
+}
+
+//Get Recommendations
+$recommended_products = [];
+if (!is_admin()) { // *** FIX: Only run recommendation logic if NOT admin ***
+    $current_user_id = (is_auth()) ? $_user->user_id : 0;
+
+    $command = 'python recommend.py ' . escapeshellarg($id) . ' ' . escapeshellarg($current_user_id);
+    $output = shell_exec($command);
+    $recommended_ids = json_decode($output, true);
+
+    if (!empty($recommended_ids)) {
+        $ids_string = implode(',', array_map('intval', $recommended_ids));
+        
+        // Fetch product details for the recommended IDs
+        $sql_rec = "SELECT product_id, name, price, image, category_id 
+                    FROM Product 
+                    WHERE product_id IN ($ids_string) AND status = 'Available'
+                    ORDER BY FIELD(product_id, $ids_string)
+                    LIMIT 6"; 
+                    
+        $result_rec = $conn->query($sql_rec);
+        if ($result_rec) {
+            $recommended_products = $result_rec->fetch_all(MYSQLI_ASSOC);
+        }
+    }
+}
+
+
+$conn->close();
 ?>
 
 <div class="container mx-auto px-4 py-8">
@@ -99,6 +140,35 @@ if (!$product) {
             
         </div>
     </div>
+
+    <?php if (!empty($recommended_products) && !is_admin()): ?>
+    <div class="mt-12">
+        <h2 class="text-2xl font-bold text-gray-900 mb-6 border-b pb-2">Recommended for You</h2>
+        
+
+        <div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-6">
+            <?php foreach ($recommended_products as $rec_product): ?>
+                <a href="product_details.php?id=<?= e($rec_product['product_id']) ?>" 
+                   class="block bg-white rounded-lg shadow-md hover:shadow-xl transition-shadow duration-300 overflow-hidden group">
+                    <div class="w-full h-40 bg-gray-200">
+                        <?php if (!empty($rec_product['image'])): ?>
+                            <img src="/FYP/<?= e($rec_product['image']) ?>" alt="<?= e($rec_product['name']) ?>" class="w-full h-full object-cover">
+                        <?php else: ?>
+                            <div class="w-full h-full flex items-center justify-center text-gray-400">No Image</div>
+                        <?php endif; ?>
+                    </div>
+                    <div class="p-3">
+                        <!-- Truncate text slightly more aggressively for smaller cards -->
+                        <h3 class="text-sm font-semibold text-gray-900 truncate group-hover:text-blue-600" title="<?= e($rec_product['name']) ?>">
+                            <?= e($rec_product['name']) ?>
+                        </h3>
+                        <p class="text-base font-bold text-gray-800 mt-1">RM<?= e(number_format($rec_product['price'], 2)) ?></p>
+                    </div>
+                </a>
+            <?php endforeach; ?>
+        </div>
+    </div>
+    <?php endif; ?>
 </div>
 
 <?php

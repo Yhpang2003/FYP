@@ -23,16 +23,25 @@ if (!$project) {
 }
 
 // 2. Fetch Project Steps
-$steps_result = $conn->query("SELECT * FROM Project_Step WHERE project_id = $project_id ORDER BY step_number ASC");
-$steps = $steps_result->fetch_all(MYSQLI_ASSOC);
+// *** FIXED SQL INJECTION VULNERABILITY ***
+$stmt_steps = $conn->prepare("SELECT * FROM Project_Step WHERE project_id = ? ORDER BY step_number ASC");
+$stmt_steps->bind_param("i", $project_id);
+$stmt_steps->execute();
+$steps = $stmt_steps->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt_steps->close();
+
 
 // 3. Fetch Project Materials (Joined with Product table)
+// *** FIXED SQL INJECTION VULNERABILITY ***
 $sql_materials = "SELECT pm.*, p.name, p.price, p.image, p.stock_quantity 
                   FROM Project_Material pm
                   JOIN Product p ON pm.product_id = p.product_id
-                  WHERE pm.project_id = $project_id";
-$materials_result = $conn->query($sql_materials);
-$materials = $materials_result->fetch_all(MYSQLI_ASSOC);
+                  WHERE pm.project_id = ?";
+$stmt_materials = $conn->prepare($sql_materials);
+$stmt_materials->bind_param("i", $project_id);
+$stmt_materials->execute();
+$materials = $stmt_materials->get_result()->fetch_all(MYSQLI_ASSOC);
+$stmt_materials->close();
 
 $conn->close();
 
@@ -48,7 +57,7 @@ require_once '_head.php';
         <div class="flex flex-col md:flex-row gap-8 border-b pb-6 mb-6">
             <div class="md:w-1/3">
                 <?php if (!empty($project['project_image'])): ?>
-                    <img src="<?= e($project['project_image']) ?>" alt="<?= e($project['project_name']) ?>" class="w-full h-auto object-cover rounded-lg shadow-md">
+                    <img src="/FYP/<?= e($project['project_image']) ?>" alt="<?= e($project['project_name']) ?>" class="w-full h-auto object-cover rounded-lg shadow-md">
                 <?php else: ?>
                     <div class="w-full h-48 bg-gray-200 flex items-center justify-center text-gray-400 rounded-lg">No Image Available</div>
                 <?php endif; ?>
@@ -86,16 +95,15 @@ require_once '_head.php';
                 <?php if (empty($materials)): ?>
                     <p class="text-gray-600">No materials listed for this project yet.</p>
                 <?php else: ?>
-                    
-                   
-                    
+  
                     <div class="space-y-4">
                         <?php foreach ($materials as $material): ?>
                             <div class="flex items-center justify-between p-3 border rounded-md">
                                 <div class="flex items-center">
-                                    <img src="<?= e($material['image'] ?? 'https://placehold.co/100x100/e2e8f0/cbd5e0?text=No+Image') ?>" alt="<?= e($material['name']) ?>" class="w-16 h-16 object-cover rounded-md mr-4">
+                                    <img src="/FYP/<?= e($material['image'] ?? 'https://placehold.co/100x100/e2e8f0/cbd5e0?text=No+Image') ?>" alt="<?= e($material['name']) ?>" class="w-16 h-16 object-cover rounded-md mr-4">
                                     <div>
-                                        <a href="product_details.php?id=<?= e($material['product_id']) ?>" class="font-semibold text-gray-800 hover:text-blue-600"><?= e($material['name']) ?></a>
+                                        
+                                        <a href="/FYP/product_details.php?id=<?= e($material['product_id']) ?>" class="font-semibold text-gray-800 hover:text-blue-600"><?= e($material['name']) ?></a>
                                         <p class="text-sm text-gray-600">Required: <?= e($material['quantity']) ?></p>
                                         <p class="text-sm text-gray-600">
                                             (Stock: <?= e($material['stock_quantity']) ?>)
@@ -108,7 +116,8 @@ require_once '_head.php';
                                 <!-- Add single item to cart -->
                                 <?php if ($material['stock_quantity'] > 0 && is_auth() && !is_admin()): ?>
                                     
-                                    <form action="cart.php" method="POST" class="ml-4">
+                                    
+                                    <form action="/FYP/cart.php" method="POST" class="ml-4">
                                         <input type="hidden" name="product_id" value="<?= e($material['product_id']) ?>">
                                         <input type="hidden" name="quantity" value="<?= e($material['quantity']) ?>">
                                         <button type="submit" class="bg-gray-200 hover:bg-gray-300 text-gray-700 text-sm font-semibold py-1 px-3 rounded-lg" title="Add <?= e($material['quantity']) ?> to cart">
@@ -119,9 +128,8 @@ require_once '_head.php';
                             </div>
                         <?php endforeach; ?>
                     </div>
-                    
-                    
-                    <form action="add_all.php" method="POST">
+
+                    <form action="/FYP/add_all.php" method="POST">
                         <input type="hidden" name="project_id" value="<?= e($project_id) ?>">
                         
                         <!-- Add all items to cart -->
@@ -129,12 +137,15 @@ require_once '_head.php';
                         <button type="submit" class="w-full mt-6 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg">
                             Add All Materials to Cart
                         </button>
+                        
                         <?php elseif (!is_auth()): ?>
                          <a href="/FYP/login.php" class="block text-center w-full mt-6 bg-blue-600 hover:bg-blue-700 text-white font-bold py-3 px-4 rounded-lg">
-                            Login to Add Materials to Cart
-                        </a>
+                             Login to Add Materials to Cart
+                         </a>
                         <?php endif; ?>
                     </form>
+                    
+
                 <?php endif; ?>
             </div>
         </div>
